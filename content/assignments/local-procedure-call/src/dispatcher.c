@@ -406,8 +406,8 @@ static void *connect_worker(void *arg)
 		return NULL;
 	}
 
-	/* Open response pipe in read-write mode to avoid blocking on readers */
-	int response_fd = open(work->response_pipe_name, O_RDWR | O_NONBLOCK);
+	/* Open response pipe for writing; blocks until client opens for reading */
+	int response_fd = open(work->response_pipe_name, O_WRONLY);
 
 	if (response_fd == -1) {
 		perror("open response pipe for writing");
@@ -677,6 +677,12 @@ int main(void)
 	    create_pipe(CONNECTION_REQ_PIPE, NULL) == -1) {
 		return 1;
 	}
+
+	int install_keepalive = open(INSTALL_REQ_PIPE, O_RDWR | O_NONBLOCK);
+	int connection_keepalive = open(CONNECTION_REQ_PIPE, O_RDWR | O_NONBLOCK);
+
+	if (install_keepalive == -1 || connection_keepalive == -1)
+		perror("open dispatcher keepalive");
 
 	/* Create listener threads for install and connection requests */
 	pthread_t install_thread, conn_thread, monitor_thread;
