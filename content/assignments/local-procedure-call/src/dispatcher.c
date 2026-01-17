@@ -34,6 +34,7 @@ typedef struct {
 	uint8_t version_len;
 	uint16_t call_pipe_len;
 	uint16_t return_pipe_len;
+	int call_fd;
 	int return_fd;
 	bool call_pipe_created;
 	bool return_pipe_created;
@@ -81,7 +82,8 @@ static int find_service_by_path(const char *access_path, ServiceEntry *out)
 static int register_service(const char *access_path, const char *call_pipe,
 			    const char *return_pipe, const char *version,
 			    uint8_t version_len, uint16_t cpn_len, uint16_t rpn_len,
-			    int return_fd, bool call_created, bool return_created)
+			    int call_fd, int return_fd, bool call_created,
+			    bool return_created)
 {
 	pthread_mutex_lock(&g_services_mutex);
 
@@ -107,6 +109,7 @@ static int register_service(const char *access_path, const char *call_pipe,
 	entry->version_len = version_len;
 	entry->call_pipe_len = cpn_len;
 	entry->return_pipe_len = rpn_len;
+	entry->call_fd = call_fd;
 	entry->return_fd = return_fd;
 	entry->call_pipe_created = call_created;
 	entry->return_pipe_created = return_created;
@@ -128,6 +131,8 @@ static void deregister_service(int index)
 	ServiceEntry *entry = &g_services[index];
 
 	if (entry->call_pipe_created) {
+		if (entry->call_fd >= 0)
+			close(entry->call_fd);
 		unlink(entry->call_pipe);
 		forget_pipe();
 	}
@@ -140,6 +145,8 @@ static void deregister_service(int index)
 	}
 
 	memset(entry, 0, sizeof(ServiceEntry));
+	entry->call_fd = -1;
+	entry->return_fd = -1;
 	pthread_mutex_unlock(&g_services_mutex);
 }
 
@@ -361,8 +368,11 @@ static void *install_worker(void *arg)
 		return NULL;
 	}
 
-	int return_fd = open(return_pipe_str, O_RDONLY | O_NONBLOCK);
-	if (return_fd == -1) {
+	int call_fd = open(call_pipe_str, O_RDWR | O_NONBLOCK);
+	int return_fd = open(return_pipe_str, O_RDWR | O_NONBLOCK);
+	if (call_fd == -1 || return_fd == -1) {
+		if (call_fd >= 0)
+			close(call_fd);
 		free(contents);
 		free(work);
 		return NULL;
@@ -370,7 +380,7 @@ static void *install_worker(void *arg)
 
 	/* Register the service */
 	register_service(access_path_str, call_pipe, return_pipe, version,
-			 version_len, cpn_len, rpn_len, return_fd, call_created,
+			 version_len, cpn_len, rpn_len, call_fd, return_fd, call_created,
 			 return_created);
 
 	free(contents);
