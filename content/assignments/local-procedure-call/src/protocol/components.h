@@ -17,7 +17,7 @@
 #define CALL_TOKEN_LEN 32
 
 #ifndef __packed
-// !!! A define needs to be added here
+#define __packed __attribute__((packed))
 #endif
 
 #define PACKED __packed
