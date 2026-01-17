@@ -519,62 +519,58 @@ static void *install_listener(void *arg)
 	(void)arg;
 	pthread_detach(pthread_self());
 
-	while (1) {
-		/* Open install_req_pipe for reading - blocks until a writer connects */
-		int install_req_fd = open(INSTALL_REQ_PIPE, O_RDONLY);
+	/* Open install_req_pipe once and keep a writer to avoid EOF churn */
+	int install_req_fd = open(INSTALL_REQ_PIPE, O_RDONLY);
+	if (install_req_fd == -1) {
+		perror("open install_req_pipe");
+		return NULL;
+	}
 
-		if (install_req_fd == -1) {
-			perror("open install_req_pipe");
-			sleep(1);
+	int install_keepalive = open(INSTALL_REQ_PIPE, O_WRONLY | O_NONBLOCK);
+	if (install_keepalive == -1 && errno != ENXIO)
+		perror("install keepalive");
+
+	while (1) {
+		struct InstallRequestHeader req_header;
+		ssize_t n = read_all(install_req_fd, &req_header,
+				     sizeof(struct InstallRequestHeader));
+
+		if (n <= 0)
+			continue;
+
+		if (n != sizeof(struct InstallRequestHeader))
+			continue;
+
+		uint16_t ipn_len = ntohs(req_header.m_IpnLen);
+
+		/* Read install pipe name */
+		char install_pipe_name[INSTALL_PIPE_NAME_LENGTH];
+
+		if (ipn_len >= INSTALL_PIPE_NAME_LENGTH)
+			ipn_len = INSTALL_PIPE_NAME_LENGTH - 1;
+
+		n = read_all(install_req_fd, install_pipe_name, ipn_len);
+		if (n != (ssize_t)ipn_len)
+			continue;
+
+		install_pipe_name[ipn_len] = '\0';
+
+		/* Create worker thread to handle this install */
+		InstallWorkerArg *work = malloc(sizeof(InstallWorkerArg));
+
+		if (!work)
+			continue;
+
+		strncpy(work->install_pipe_name, install_pipe_name,
+			INSTALL_PIPE_NAME_LENGTH - 1);
+		work->install_pipe_name[INSTALL_PIPE_NAME_LENGTH - 1] = '\0';
+
+		pthread_t worker;
+
+		if (pthread_create(&worker, NULL, install_worker, work) != 0) {
+			free(work);
 			continue;
 		}
-
-		while (1) {
-			struct InstallRequestHeader req_header;
-			ssize_t n = read_all(install_req_fd, &req_header,
-					     sizeof(struct InstallRequestHeader));
-
-			if (n <= 0) {
-				/* EOF or error - reopen pipe */
-				break;
-			}
-
-			if (n != sizeof(struct InstallRequestHeader))
-				break;
-
-			uint16_t ipn_len = ntohs(req_header.m_IpnLen);
-
-			/* Read install pipe name */
-			char install_pipe_name[INSTALL_PIPE_NAME_LENGTH];
-
-			if (ipn_len >= INSTALL_PIPE_NAME_LENGTH)
-				ipn_len = INSTALL_PIPE_NAME_LENGTH - 1;
-
-			n = read_all(install_req_fd, install_pipe_name, ipn_len);
-			if (n != (ssize_t)ipn_len)
-				break;
-
-			install_pipe_name[ipn_len] = '\0';
-
-			/* Create worker thread to handle this install */
-			InstallWorkerArg *work = malloc(sizeof(InstallWorkerArg));
-
-			if (!work)
-				continue;
-
-			strncpy(work->install_pipe_name, install_pipe_name,
-				INSTALL_PIPE_NAME_LENGTH - 1);
-			work->install_pipe_name[INSTALL_PIPE_NAME_LENGTH - 1] = '\0';
-
-			pthread_t worker;
-
-			if (pthread_create(&worker, NULL, install_worker, work) != 0) {
-				free(work);
-				continue;
-			}
-		}
-
-		close(install_req_fd);
 	}
 
 	return NULL;
@@ -586,74 +582,72 @@ static void *connect_listener(void *arg)
 	(void)arg;
 	pthread_detach(pthread_self());
 
-	while (1) {
-		/* Open connection_req_pipe for reading - blocks until a writer connects */
-		int conn_req_fd = open(CONNECTION_REQ_PIPE, O_RDONLY);
+	/* Open connection_req_pipe once and keep a writer to avoid EOF churn */
+	int conn_req_fd = open(CONNECTION_REQ_PIPE, O_RDONLY);
+	if (conn_req_fd == -1) {
+		perror("open connection_req_pipe");
+		return NULL;
+	}
 
-		if (conn_req_fd == -1) {
-			perror("open connection_req_pipe");
-			sleep(1);
+	int conn_keepalive = open(CONNECTION_REQ_PIPE, O_WRONLY | O_NONBLOCK);
+	if (conn_keepalive == -1 && errno != ENXIO)
+		perror("conn keepalive");
+
+	while (1) {
+		struct ConnectionRequestHeader req_header;
+		ssize_t n = read_all(conn_req_fd, &req_header,
+				     sizeof(struct ConnectionRequestHeader));
+
+		if (n <= 0)
+			continue;
+
+		if (n != sizeof(struct ConnectionRequestHeader))
+			continue;
+
+		uint32_t rpn_len = ntohl(req_header.m_RpnLen);
+		uint32_t ap_len = ntohl(req_header.m_ApLen);
+
+		/* Read response pipe name and access path */
+		char response_pipe_name[CONNECT_PIPE_NAME_LENGTH];
+		char access_path[ACCESS_PATH_LENGTH];
+
+		if (rpn_len >= CONNECT_PIPE_NAME_LENGTH)
+			rpn_len = CONNECT_PIPE_NAME_LENGTH - 1;
+		if (ap_len >= ACCESS_PATH_LENGTH)
+			ap_len = ACCESS_PATH_LENGTH - 1;
+
+		n = read_all(conn_req_fd, response_pipe_name, rpn_len);
+		if (n != (ssize_t)rpn_len)
+			continue;
+		response_pipe_name[rpn_len] = '\0';
+
+		n = read_all(conn_req_fd, access_path, ap_len);
+		if (n != (ssize_t)ap_len)
+			continue;
+		access_path[ap_len] = '\0';
+
+		if (create_pipe(response_pipe_name, NULL) == -1)
+			continue;
+
+		/* Create worker thread to handle this connection */
+		ConnectWorkerArg *work = malloc(sizeof(ConnectWorkerArg));
+
+		if (!work)
+			continue;
+
+		strncpy(work->response_pipe_name, response_pipe_name,
+			CONNECT_PIPE_NAME_LENGTH - 1);
+		work->response_pipe_name[CONNECT_PIPE_NAME_LENGTH - 1] = '\0';
+		strncpy(work->access_path, access_path,
+			ACCESS_PATH_LENGTH - 1);
+		work->access_path[ACCESS_PATH_LENGTH - 1] = '\0';
+
+		pthread_t worker;
+
+		if (pthread_create(&worker, NULL, connect_worker, work) != 0) {
+			free(work);
 			continue;
 		}
-
-		while (1) {
-			struct ConnectionRequestHeader req_header;
-			ssize_t n = read_all(conn_req_fd, &req_header,
-					     sizeof(struct ConnectionRequestHeader));
-
-			if (n <= 0)
-				break;
-
-			if (n != sizeof(struct ConnectionRequestHeader))
-				break;
-
-			uint32_t rpn_len = ntohl(req_header.m_RpnLen);
-			uint32_t ap_len = ntohl(req_header.m_ApLen);
-
-			/* Read response pipe name and access path */
-			char response_pipe_name[CONNECT_PIPE_NAME_LENGTH];
-			char access_path[ACCESS_PATH_LENGTH];
-
-			if (rpn_len >= CONNECT_PIPE_NAME_LENGTH)
-				rpn_len = CONNECT_PIPE_NAME_LENGTH - 1;
-			if (ap_len >= ACCESS_PATH_LENGTH)
-				ap_len = ACCESS_PATH_LENGTH - 1;
-
-			n = read_all(conn_req_fd, response_pipe_name, rpn_len);
-			if (n != (ssize_t)rpn_len)
-				break;
-			response_pipe_name[rpn_len] = '\0';
-
-			n = read_all(conn_req_fd, access_path, ap_len);
-			if (n != (ssize_t)ap_len)
-				break;
-			access_path[ap_len] = '\0';
-
-			if (create_pipe(response_pipe_name, NULL) == -1)
-				continue;
-
-			/* Create worker thread to handle this connection */
-			ConnectWorkerArg *work = malloc(sizeof(ConnectWorkerArg));
-
-			if (!work)
-				continue;
-
-			strncpy(work->response_pipe_name, response_pipe_name,
-				CONNECT_PIPE_NAME_LENGTH - 1);
-			work->response_pipe_name[CONNECT_PIPE_NAME_LENGTH - 1] = '\0';
-			strncpy(work->access_path, access_path,
-				ACCESS_PATH_LENGTH - 1);
-			work->access_path[ACCESS_PATH_LENGTH - 1] = '\0';
-
-			pthread_t worker;
-
-			if (pthread_create(&worker, NULL, connect_worker, work) != 0) {
-				free(work);
-				continue;
-			}
-		}
-
-		close(conn_req_fd);
 	}
 
 	return NULL;
