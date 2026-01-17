@@ -61,6 +61,9 @@ typedef struct {
 	char access_path[ACCESS_PATH_LENGTH];
 } ConnectWorkerArg;
 
+/* Forward declarations */
+static void forget_pipe(void);
+
 /* Thread-safe service registry functions */
 static int find_service_by_path(const char *access_path, ServiceEntry *out)
 {
