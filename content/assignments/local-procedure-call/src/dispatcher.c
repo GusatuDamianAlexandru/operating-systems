@@ -406,8 +406,8 @@ static void *connect_worker(void *arg)
 		return NULL;
 	}
 
-	/* Open response pipe for writing - blocks until client opens for reading */
-	int response_fd = open(work->response_pipe_name, O_WRONLY);
+	/* Open response pipe in read-write mode to avoid blocking on readers */
+	int response_fd = open(work->response_pipe_name, O_RDWR | O_NONBLOCK);
 
 	if (response_fd == -1) {
 		perror("open response pipe for writing");
