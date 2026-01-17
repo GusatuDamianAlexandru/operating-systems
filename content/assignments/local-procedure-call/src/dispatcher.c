@@ -629,6 +629,9 @@ static void *connect_listener(void *arg)
 				break;
 			access_path[ap_len] = '\0';
 
+			if (create_pipe(response_pipe_name, NULL) == -1)
+				continue;
+
 			/* Create worker thread to handle this connection */
 			ConnectWorkerArg *work = malloc(sizeof(ConnectWorkerArg));
 
