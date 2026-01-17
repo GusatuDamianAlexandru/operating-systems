@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <semaphore.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -49,6 +50,7 @@ static pthread_mutex_t g_services_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* Global pipe counter with mutex */
 static size_t g_pipe_count = 0;
 static pthread_mutex_t g_pipes_mutex = PTHREAD_MUTEX_INITIALIZER;
+static sem_t g_connect_slots;
 
 /* Worker thread argument for install */
 typedef struct {
@@ -388,6 +390,7 @@ static void *install_worker(void *arg)
 
 	free(contents);
 	free(work);
+	sem_post(&g_connect_slots);
 	return NULL;
 }
 
@@ -453,6 +456,7 @@ static void *connect_worker(void *arg)
 		forget_pipe();
 
 	free(work);
+	sem_post(&g_connect_slots);
 	return NULL;
 }
 
@@ -632,11 +636,16 @@ static void *connect_listener(void *arg)
 		if (create_pipe(response_pipe_name, NULL) == -1)
 			continue;
 
+		if (sem_wait(&g_connect_slots) != 0)
+			continue;
+
 		/* Create worker thread to handle this connection */
 		ConnectWorkerArg *work = malloc(sizeof(ConnectWorkerArg));
 
-		if (!work)
+		if (!work) {
+			sem_post(&g_connect_slots);
 			continue;
+		}
 
 		strncpy(work->response_pipe_name, response_pipe_name,
 			CONNECT_PIPE_NAME_LENGTH - 1);
@@ -649,6 +658,7 @@ static void *connect_listener(void *arg)
 
 		if (pthread_create(&worker, NULL, connect_worker, work) != 0) {
 			free(work);
+			sem_post(&g_connect_slots);
 			continue;
 		}
 	}
@@ -683,6 +693,11 @@ int main(void)
 
 	/* Create listener threads for install and connection requests */
 	pthread_t install_thread, conn_thread, monitor_thread;
+
+	if (sem_init(&g_connect_slots, 0, 64) != 0) {
+		perror("sem_init");
+		return 1;
+	}
 
 	if (pthread_create(&install_thread, NULL, install_listener, NULL) != 0) {
 		perror("pthread_create install_listener");
