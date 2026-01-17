@@ -33,6 +33,9 @@ typedef struct {
 	uint8_t version_len;
 	uint16_t call_pipe_len;
 	uint16_t return_pipe_len;
+	bool call_pipe_created;
+	bool return_pipe_created;
+	unsigned int missed_checks;
 } ServiceEntry;
 
 /* Global service registry with mutex */
@@ -75,7 +78,8 @@ static int find_service_by_path(const char *access_path, ServiceEntry *out)
 
 static int register_service(const char *access_path, const char *call_pipe,
 			    const char *return_pipe, const char *version,
-			    uint8_t version_len, uint16_t cpn_len, uint16_t rpn_len)
+			    uint8_t version_len, uint16_t cpn_len, uint16_t rpn_len,
+			    bool call_created, bool return_created)
 {
 	pthread_mutex_lock(&g_services_mutex);
 
@@ -94,13 +98,44 @@ static int register_service(const char *access_path, const char *call_pipe,
 	memcpy(entry->call_pipe, call_pipe, cpn_len);
 	memcpy(entry->return_pipe, return_pipe, rpn_len);
 	memcpy(entry->version, version, version_len);
+	entry->access_path[ACCESS_PATH_LENGTH - 1] = '\0';
+	entry->call_pipe[COMM_PIPE_NAME_LENGTH - 1] = '\0';
+	entry->return_pipe[COMM_PIPE_NAME_LENGTH - 1] = '\0';
+	entry->version[VERSION_LENGTH - 1] = '\0';
 	entry->version_len = version_len;
 	entry->call_pipe_len = cpn_len;
 	entry->return_pipe_len = rpn_len;
+	entry->call_pipe_created = call_created;
+	entry->return_pipe_created = return_created;
+	entry->missed_checks = 0;
 
 	g_service_count++;
 	pthread_mutex_unlock(&g_services_mutex);
 	return 0;
+}
+
+static void deregister_service(int index)
+{
+	pthread_mutex_lock(&g_services_mutex);
+	if (index < 0 || index >= g_service_count) {
+		pthread_mutex_unlock(&g_services_mutex);
+		return;
+	}
+
+	ServiceEntry *entry = &g_services[index];
+
+	if (entry->call_pipe_created) {
+		unlink(entry->call_pipe);
+		forget_pipe();
+	}
+
+	if (entry->return_pipe_created) {
+		unlink(entry->return_pipe);
+		forget_pipe();
+	}
+
+	memset(entry, 0, sizeof(ServiceEntry));
+	pthread_mutex_unlock(&g_services_mutex);
 }
 
 /* Utility functions */
@@ -218,11 +253,14 @@ static ssize_t read_all(int fd, void *buf, size_t count)
 static void *install_worker(void *arg)
 {
 	InstallWorkerArg *work = (InstallWorkerArg *)arg;
+	bool install_created = false;
+	bool call_created = false;
+	bool return_created = false;
 
 	pthread_detach(pthread_self());
 
 	/* Create the install pipe if it doesn't exist */
-	if (create_pipe(work->install_pipe_name, NULL) == -1) {
+	if (create_pipe(work->install_pipe_name, &install_created) == -1) {
 		free(work);
 		return NULL;
 	}
@@ -251,6 +289,14 @@ static void *install_worker(void *arg)
 	uint16_t cpn_len = ntohs(install_header.m_CpnLen);
 	uint16_t rpn_len = ntohs(install_header.m_RpnLen);
 	uint16_t ap_len = ntohs(install_header.m_ApLen);
+	if (version_len >= VERSION_LENGTH)
+		version_len = VERSION_LENGTH - 1;
+	if (cpn_len >= COMM_PIPE_NAME_LENGTH)
+		cpn_len = COMM_PIPE_NAME_LENGTH - 1;
+	if (rpn_len >= COMM_PIPE_NAME_LENGTH)
+		rpn_len = COMM_PIPE_NAME_LENGTH - 1;
+	if (ap_len >= ACCESS_PATH_LENGTH)
+		ap_len = ACCESS_PATH_LENGTH - 1;
 
 	/* Allocate buffer for contents */
 	size_t total_len = version_len + cpn_len + rpn_len + ap_len;
@@ -272,6 +318,10 @@ static void *install_worker(void *arg)
 	contents[total_len] = '\0';
 
 	close(install_fd);
+	if (install_created) {
+		unlink(work->install_pipe_name);
+		forget_pipe();
+	}
 
 	/* Extract fields */
 	char *version = contents;
@@ -294,30 +344,21 @@ static void *install_worker(void *arg)
 	memcpy(return_pipe_str, return_pipe, rpn_len);
 
 	/* Create call and return pipes for the service */
-	if (create_pipe(call_pipe_str, NULL) == -1) {
+	if (create_pipe(call_pipe_str, &call_created) == -1) {
 		free(contents);
 		free(work);
 		return NULL;
 	}
 
-	if (create_pipe(return_pipe_str, NULL) == -1) {
+	if (create_pipe(return_pipe_str, &return_created) == -1) {
 		free(contents);
 		free(work);
 		return NULL;
 	}
-
-	/* Open pipes in read-write mode to keep them alive and prevent SIGPIPE */
-	int call_fd = open(call_pipe_str, O_RDWR | O_NONBLOCK);
-	int return_fd = open(return_pipe_str, O_RDWR | O_NONBLOCK);
-
-	/* We intentionally keep these file descriptors open
-	 * to prevent SIGPIPE when clients disconnect */
-	(void)call_fd;
-	(void)return_fd;
 
 	/* Register the service */
 	register_service(access_path_str, call_pipe, return_pipe, version,
-			 version_len, cpn_len, rpn_len);
+			 version_len, cpn_len, rpn_len, call_created, return_created);
 
 	free(contents);
 	free(work);
@@ -387,6 +428,66 @@ static void *connect_worker(void *arg)
 
 	free(work);
 	return NULL;
+}
+
+static bool service_has_reader(const ServiceEntry *entry)
+{
+	int fd = open(entry->call_pipe, O_WRONLY | O_NONBLOCK);
+
+	if (fd == -1) {
+		if (errno == ENXIO || errno == ENOENT)
+			return false;
+		return true;
+	}
+
+	close(fd);
+	return true;
+}
+
+static void *service_monitor(void *arg)
+{
+	(void)arg;
+	pthread_detach(pthread_self());
+
+	while (1) {
+		pthread_mutex_lock(&g_services_mutex);
+		int service_count = g_service_count;
+		pthread_mutex_unlock(&g_services_mutex);
+
+		for (int i = 0; i < service_count; i++) {
+			ServiceEntry snapshot;
+
+			pthread_mutex_lock(&g_services_mutex);
+			if (i >= g_service_count) {
+				pthread_mutex_unlock(&g_services_mutex);
+				break;
+			}
+			snapshot = g_services[i];
+			pthread_mutex_unlock(&g_services_mutex);
+
+			if (snapshot.call_pipe[0] == '\0')
+				continue;
+
+			if (!service_has_reader(&snapshot)) {
+				pthread_mutex_lock(&g_services_mutex);
+				if (i < g_service_count) {
+					g_services[i].missed_checks++;
+					if (g_services[i].missed_checks >= 2) {
+						pthread_mutex_unlock(&g_services_mutex);
+						deregister_service(i);
+						continue;
+					}
+				}
+				pthread_mutex_unlock(&g_services_mutex);
+			} else {
+				pthread_mutex_lock(&g_services_mutex);
+				if (i < g_service_count)
+					g_services[i].missed_checks = 0;
+				pthread_mutex_unlock(&g_services_mutex);
+			}
+		}
+		sleep(1);
+	}
 }
 
 /* Main thread for listening to install requests */
@@ -550,7 +651,7 @@ int main(void)
 	}
 
 	/* Create listener threads for install and connection requests */
-	pthread_t install_thread, conn_thread;
+	pthread_t install_thread, conn_thread, monitor_thread;
 
 	if (pthread_create(&install_thread, NULL, install_listener, NULL) != 0) {
 		perror("pthread_create install_listener");
@@ -559,6 +660,11 @@ int main(void)
 
 	if (pthread_create(&conn_thread, NULL, connect_listener, NULL) != 0) {
 		perror("pthread_create connect_listener");
+		return 1;
+	}
+
+	if (pthread_create(&monitor_thread, NULL, service_monitor, NULL) != 0) {
+		perror("pthread_create service_monitor");
 		return 1;
 	}
 
