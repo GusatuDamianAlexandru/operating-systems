@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@ typedef struct {
 	uint8_t version_len;
 	uint16_t call_pipe_len;
 	uint16_t return_pipe_len;
+	int return_fd;
 	bool call_pipe_created;
 	bool return_pipe_created;
 	unsigned int missed_checks;
@@ -79,7 +81,7 @@ static int find_service_by_path(const char *access_path, ServiceEntry *out)
 static int register_service(const char *access_path, const char *call_pipe,
 			    const char *return_pipe, const char *version,
 			    uint8_t version_len, uint16_t cpn_len, uint16_t rpn_len,
-			    bool call_created, bool return_created)
+			    int return_fd, bool call_created, bool return_created)
 {
 	pthread_mutex_lock(&g_services_mutex);
 
@@ -105,6 +107,7 @@ static int register_service(const char *access_path, const char *call_pipe,
 	entry->version_len = version_len;
 	entry->call_pipe_len = cpn_len;
 	entry->return_pipe_len = rpn_len;
+	entry->return_fd = return_fd;
 	entry->call_pipe_created = call_created;
 	entry->return_pipe_created = return_created;
 	entry->missed_checks = 0;
@@ -130,6 +133,8 @@ static void deregister_service(int index)
 	}
 
 	if (entry->return_pipe_created) {
+		if (entry->return_fd >= 0)
+			close(entry->return_fd);
 		unlink(entry->return_pipe);
 		forget_pipe();
 	}
@@ -356,9 +361,17 @@ static void *install_worker(void *arg)
 		return NULL;
 	}
 
+	int return_fd = open(return_pipe_str, O_RDONLY | O_NONBLOCK);
+	if (return_fd == -1) {
+		free(contents);
+		free(work);
+		return NULL;
+	}
+
 	/* Register the service */
 	register_service(access_path_str, call_pipe, return_pipe, version,
-			 version_len, cpn_len, rpn_len, call_created, return_created);
+			 version_len, cpn_len, rpn_len, return_fd, call_created,
+			 return_created);
 
 	free(contents);
 	free(work);
@@ -635,6 +648,8 @@ static void *connect_listener(void *arg)
 
 int main(void)
 {
+	signal(SIGPIPE, SIG_IGN);
+
 	/* Ensure directories exist */
 	if (ensure_directory(DISPATCHER_DIR) == -1 ||
 	    ensure_directory(PIPES_DIR) == -1) {
